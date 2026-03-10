@@ -2,7 +2,6 @@
   "env": {
     "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
     "ANTHROPIC_API_KEY": "dummy",
-    "CLAUDE_CONFIG_DIR": "$HOME/.claude",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
   "permissions": {
