@@ -266,24 +266,45 @@ Gluon kernels compile to GCN ISA where `s_waitcnt` insertion is controlled by th
 
 **Always check register headroom before adding prefetch buffers:**
 
+On CDNA3 (gfx942 MI300X/MI308), VGPRs are split into **two separate register files**:
+- **arch_vgpr** (256 per SIMD): used by VALU, VMEM loads, LDS ops, and prefetch buffers
+- **accum_vgpr / AGPR** (256 per SIMD): used exclusively by MFMA result writeback
+
+Prefetch buffers consume **arch_vgpr only** (they hold global load results). MFMA accumulators use **accum_vgpr only**. These do not compete.
+
 ```python
-# Estimate VGPR cost of prefetch buffers:
-#   - Each global_load_dwordx4 = 4 VGPRs per load
-#   - 8 K-cache loads = 8 × 4 = 32 VGPRs for one buffer set
-#   - Double-buffering = 2 × 32 = 64 VGPRs (but one set is reused)
-#   - Net additional VGPRs ≈ 32 (the "next" buffer)
+# Estimate arch_vgpr cost of prefetch buffers:
+#   - Each global_load_dwordx4 = 4 arch_vgpr per load
+#   - 8 K-cache loads = 8 × 4 = 32 arch_vgpr for one buffer set
+#   - Double-buffering = 2 × 32 = 64 arch_vgpr (but one set is reused)
+#   - Net additional arch_vgpr ≈ 32 (the "next" buffer)
 #
-# On MI308 (gfx942): max 512 VGPRs (VGPR + AGPR share archVGPR file)
-# If current usage is 256 VGPR + 55 AGPR = 311, headroom = 201
-# → Safe to add ~128 VGPRs for double-buffering
+# On MI300X (gfx942): 256 arch_vgpr + 256 accum_vgpr per SIMD
+# Occupancy = 256 / max(arch_vgpr, accum_vgpr) waves per SIMD
+#
+# Example: arch=148, accum=148 → occupancy bottleneck = 148 → 1 wave
+# Adding 32 arch_vgpr → arch=180, accum=148 → bottleneck = 180 → still 1 wave (safe)
+# Adding 120 arch_vgpr → arch=268 → SPILL (critical, exceeds 256 per SIMD)
 ```
 
-**Critical thresholds (gfx942 MI308):**
-| VGPRs Used | Max Waves/SIMD | Impact |
-|-----------|---------------|--------|
-| ≤ 256     | 2             | Current typical occupancy |
-| ≤ 512     | 1             | Minimum occupancy, still functional |
-| > 512     | **SPILL**     | Register overflow → memory spills → severe perf regression |
+**Critical thresholds (gfx942, per register file):**
+| Register File | Count | Max Waves/SIMD | Impact |
+|--------------|-------|---------------|--------|
+| arch_vgpr ≤ 128 | or accum ≤ 128 | 2 | Good occupancy |
+| arch_vgpr ≤ 256 | or accum ≤ 256 | 1 | Minimum occupancy |
+| arch_vgpr > 256 | or accum > 256 | **SPILL** | Register overflow → severe perf regression |
+
+**How to check current VGPR allocation** (from rocprofv3 database):
+```sql
+SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
+WHERE ks.KernelName LIKE '%target_kernel%'
+LIMIT 5;
+```
+
+**WARNING**: Do NOT use `maxnreg` to force `accum_vgpr=0` in hopes of freeing register space for prefetch. This forces MFMA results through arch_vgpr via `v_accvgpr_read` spills, causing massive slowdown (measured 4.5x GPU kernel regression). See `/optimize-pa-decode-gluon` Section 1.2.1.
 
 ### What Prefetch Can and Cannot Do in Gluon
 
@@ -348,6 +369,62 @@ After applying prefetch:
    - Higher MFMA utilization percentage
    - Overall kernel duration reduction
 3. **Register pressure**: Check that `waves_per_eu` (occupancy) didn't drop. If it did, consider prefetching fewer buffers (e.g., only keys, not values).
+
+## FlyDSL: scf.for with Loop-Carried Prefetch
+
+In FlyDSL kernels, Python-level `for _pi in range(N)` gets traced into N flat copies that LLVM re-rolls. This makes the `data = next_data` swap **invisible** to MLIR — both variables alias the same SSA value, so LLVM hoists loads as loop-invariant.
+
+**Solution**: Use FlyDSL's `scf.for` with `init=` (loop-carried values) to create genuine SSA phi nodes. See the `flydsl-kernel-authoring` skill, section "scf.for with Loop-Carried Values", for the full pattern and three critical pitfalls.
+
+### PA Decode Kernel Example (verified, 112us → 0.75x Gluon)
+
+State inventory (15 values carried across iterations):
+- 8 × `vector<4xi32>` — K data (4 tiles × 2 loads)
+- 1 × `i32` — partition_start
+- 2 × `i32` — block table values (phys_block/page_off or phys_0/phys_1)
+- 2 × `f32` — running_max, running_sum (online softmax)
+- 2 × `vector<4xf32>` — PV accumulators
+
+```python
+# Pack/unpack helpers
+def _pack(kv_flat, part_start, bt_vals, rmax, rsum, acc_pv):
+    raw = kv_flat + [part_start] + bt_vals + [rmax, rsum] + acc_pv
+    return [v.ir_value() if hasattr(v, 'ir_value') else v for v in raw]
+
+def _unpack(state):
+    kv_flat = list(state[0:8])
+    kv = [[kv_flat[t*2], kv_flat[t*2+1]] for t in range(4)]
+    return kv, state[8], list(state[9:11]), state[11], state[12], [state[13], state[14]]
+
+# Prologue
+pf_0 = issue_bt_k_loads(partition_0)
+init_state = _pack(flatten(pf_0['kv']), pf_0['part_start'], ...)
+
+# scf.for (bounds MUST be arith.index, not Python ints!)
+for iv, state in range(arith.index(0), arith.index(N-1), arith.index(1), init=init_state):
+    kv, part_start, bt, rmax, rsum, acc = _unpack(state)
+    rmax, rsum, acc = compute_qk_softmax_pv(kv, part_start, bt, rmax, rsum, acc)
+    pf_next = issue_bt_k_loads(next_partition(iv + 1))
+    results = yield _pack(flatten(pf_next['kv']), pf_next['part_start'], ...)
+
+# Epilogue: clear SmemPtr caches, compute last partition, write output
+smem_ptr._view_cache = None
+kv, part_start, bt, rmax, rsum, acc = _unpack(results)
+compute_qk_softmax_pv(kv, part_start, bt, rmax, rsum, acc)
+write_output(rmax, rsum, acc)
+```
+
+**ISA result**: 8 K-prefetch `buffer_load_dwordx4` appear at the END of the loop body (after PV MFMA), overlapping with the MFMA pipeline drain. The prologue has 8 K loads before the loop. The epilogue has 8 V loads only (no K loads needed).
+
+### Key Differences from Triton/Gluon Prefetch
+
+| Aspect | Triton/Gluon | FlyDSL |
+|--------|-------------|--------|
+| Loop type | Python `for` → LLVM re-rolled | `scf.for` with MLIR phi nodes |
+| Swap mechanism | Python `data = next_data` | `yield` → `scf.yield` → block args |
+| Compiler visibility | LLVM sees aliased SSA values | MLIR sees distinct block args per iteration |
+| Guard for last iter | `if i + 1 < N` inside loop | Prologue/epilogue pattern (loop has N-1 iters) |
+| State packing | N/A (Python variables) | Flat list of unwrapped `ir.Value`s |
 
 ## When NOT To Use
 

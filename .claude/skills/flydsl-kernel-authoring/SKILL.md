@@ -214,6 +214,61 @@ for i in range(runtime_value):
     ...
 ```
 
+### scf.for with Loop-Carried Values (Software Pipelining)
+
+Use `init=` on `range()` to create an `scf.for` with explicit SSA phi nodes for loop-carried state. This is required for software pipelining (prefetch patterns) where data must flow across iterations.
+
+**Pattern** (from `preshuffle_gemm.py`):
+```python
+# Prologue: load first tile
+tile_0 = prefetch(0)
+init_state = [acc_init, tile_0_flat_val1, tile_0_flat_val2, ...]
+
+# scf.for with loop-carried state
+# CRITICAL: bounds MUST be arith.index() values, NOT Python ints!
+_start = arith.index(0)
+_stop = arith.index(N - 1)
+_step = arith.index(1)
+for iv, state in range(_start, _stop, _step, init=init_state):
+    acc_in = state[0]
+    tile_in = state[1:]
+
+    next_tile = prefetch(iv + 1)      # load NEXT data
+    acc_in = compute(acc_in, tile_in)  # compute CURRENT
+
+    results = yield [acc_in] + next_tile  # carry to next iter
+
+# Epilogue: process last tile from results
+acc_final = results[0]
+tile_final = results[1:]
+compute(acc_final, tile_final)
+```
+
+**How it works in MLIR:**
+| Element | Meaning |
+|---|---|
+| `init=init_state` | List of SSA values that seed the `scf.for` block arguments for iteration 0 |
+| `state` | The loop-carried block arguments (phi nodes) for THIS iteration |
+| `yield [...]` | `scf.yield` feeds values back as next iteration's `state` |
+| `results` | After loop exits, holds the last `yield`'s values (the `scf.for` op results) |
+
+**Three critical pitfalls (all verified by debugging):**
+
+1. **Loop bounds must be `arith.index()`, NOT Python ints.** If you write `range(0, 15, 1, init=...)`, the AST rewriter treats constant bounds as a Python `range` and unrolls the loop — silently ignoring `init=`. Use `arith.index(0)`, `arith.index(15)`, `arith.index(1)` instead.
+
+2. **All `init` values must be raw MLIR `ir.Value`s.** FlyDSL wrappers like `Int32` / `Float32` don't have `.type` (only `.dtype`), and `scf.ForOp.__init__` calls `arg.type`. Unwrap via:
+   ```python
+   def _unwrap(v):
+       return v.ir_value() if hasattr(v, 'ir_value') else v
+   init_state = [_unwrap(v) for v in raw_list]
+   ```
+
+3. **Clear `SmemPtr._view_cache` before epilogue.** `SmemPtr.get()` caches the `memref.view` it creates. If called inside the `scf.for` body, the cached view is defined in the loop scope. Using it in the epilogue (outside the loop) causes an SSA dominance error. Fix:
+   ```python
+   # After the scf.for loop, before epilogue compute:
+   my_smem_ptr._view_cache = None
+   ```
+
 ### Arithmetic Operations
 ```python
 from flydsl.expr import arith
