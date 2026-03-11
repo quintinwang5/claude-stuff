@@ -38,6 +38,7 @@ Run `/kernel-trace-analysis` first. Apply this skill when the trace shows:
 - **Broadcast**: when 2+ threads access the **same address** in the same bank, hardware broadcasts (no conflict)
 - LDS throughput: **128 bytes/cycle** (peak, no conflicts)
 - LDS latency: **~20-40 cycles** (async, hidden if enough work between write and read)
+- **VGPR context**: LDS ops use **arch_vgpr** (not accum_vgpr). On CDNA3, arch_vgpr and accum_vgpr are separate 256-entry register files. LDS optimization does not interact with MFMA accumulator register pressure. See `/kernel-trace-analysis` Section 5.5 for VGPR architecture details.
 
 ### LDS Instruction Model
 

@@ -48,18 +48,45 @@ When this skill is invoked, systematically analyze and optimize the following ar
 #### 1.2 Compute Efficiency
 - [ ] **MFMA instruction selection**: Verify `QK_PV_MFMA_INSTR_SHAPE` matches the optimal MFMA instruction for the target arch. For CDNA3 fp8: `mfma_f32_16x16x32_fp8`, for CDNA3 bf16: `mfma_f32_16x16x16_bf16`. For CDNA4: check if 32x32 variants or new instructions give better throughput.
 - [ ] **Warp-level parallelism**: Current config uses 4 warps per CTA (`warps_per_cta=[1,4]` for MFMA). For CDNA4 with higher register file, consider `warps_per_cta=[2,4]` or `[1,8]` if register pressure allows.
-- [ ] **waves_per_eu tuning**: The wrapper sets `waves_per_eu` to 3 or 4 based on `QUERY_GROUP_SIZE_POW2`. Profile to determine if this is optimal. Lower values reduce register spilling but may underutilize the CU.
-- [ ] **Occupancy vs register pressure**: The large_block kernel has more live variables. Check if `maxnreg` pragma or register allocation hints could help.
+- [ ] **waves_per_eu tuning**: The wrapper sets `waves_per_eu` to 3 or 4 based on `QUERY_GROUP_SIZE_POW2`. Profile to determine if this is optimal. Lower values reduce register spilling but may underutilize the CU. **NOTE**: Autotune sweep across num_stages(1-4) x waves_per_eu(0-4) showed no meaningful difference for the `sliding_window_head_1` kernel - default Triton settings are already reasonable for this kernel.
+- [ ] **Occupancy vs register pressure**: The large_block kernel has more live variables. Check if `maxnreg` pragma or register allocation hints could help. **CRITICAL WARNING - see Section 1.2.1 below**.
 - [ ] **exp2 vs exp**: Already using `tl.math.exp2` with `LOG2_E` multiplier - this is optimal for AMD GPUs. Confirm no inadvertent `tl.exp` calls.
+
+#### 1.2.1 VGPR Architecture on CDNA3 (CRITICAL)
+
+On MI300X (gfx942), VGPRs are split into two **separate** register files:
+- **arch_vgpr**: General-purpose vector registers (used by VALU, VMEM, LDS ops)
+- **accum_vgpr (AGPR)**: Accumulator registers (used exclusively by MFMA result writeback)
+
+**Occupancy** is determined by: `256 / max(arch_vgpr, accum_vgpr)` waves per SIMD (4 SIMDs per CU).
+
+**WARNING: `maxnreg` on CDNA3 is DANGEROUS for MFMA-heavy kernels:**
+- `maxnreg=64` forces the compiler to set `accum_vgpr=0`, which doubles occupancy (12.5% -> 25%)
+- BUT this forces ALL MFMA results to be moved through arch_vgpr via `v_accvgpr_read` instructions
+- The result is **massive register spilling** and MFMA pipeline stalls
+- Real-world impact: GPU kernel time increased from ~149us to ~670us (4.5x SLOWER) even though occupancy doubled
+- **End-to-end benchmark (triton.testing.do_bench) masked this regression** because CPU dispatch overhead (~211us) dominated the measurement, making the change appear neutral
+
+**Rule**: Never use `maxnreg` to eliminate accum_vgpr usage on CDNA3. Accum_vgpr are essentially free for MFMA - they don't compete with arch_vgpr for occupancy. Only consider `maxnreg` to reduce arch_vgpr if it's the occupancy bottleneck.
+
+To check VGPR allocation, query the rocprofv3 database:
+```sql
+SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
+WHERE ks.KernelName LIKE '%paged_attention%'
+LIMIT 5;
+```
 
 #### 1.3 Loop Structure & Prefetch
 - [ ] **K-cache prefetch (double-buffer)**: The main KV loop issues 8× `global_load_dwordx4` for K-cache tiles, then hits `s_waitcnt vmcnt(0)` with **~33K stall cycles** before the first MFMA. The 126 instructions between load and consume are not enough to hide global memory latency. Apply double-buffering: pre-load the first iteration's K-cache before the loop, issue the next iteration's K-cache loads right after the swap, then compute MFMA on the current buffer while the next buffer is in flight.
-  - **Register budget**: Trace shows VGPR=256, AGPR=55, total=311/512. There is ~201 regs headroom — enough for a second set of 8× dwordx4 buffers (~128 VGPRs).
+  - **Register budget**: Trace shows VGPR=256, AGPR=55, total=311/512. There is ~201 regs headroom — enough for a second set of 8× dwordx4 buffers (~128 VGPRs). **NOTE**: arch_vgpr and accum_vgpr are separate register files on CDNA3 - see Section 1.2.1. Headroom must be calculated for each file independently.
   - **Pattern**: See `/prefetch-data-load` skill for the mechanical transformation.
 - [ ] **V-value load hoisting**: V-value loads (8× `global_load_dwordx4` at source :1669) currently start after the softmax reduce phase. Their addresses can be computed before the reduce. **Hoist V-value load issuance into the softmax reduce barrier-wait region** (L606-L770) to overlap V-value fetch latency (~17K idle cycles) with barrier stalls (~96K stall cycles). This turns wasted barrier-wait time into useful prefetch.
 - [ ] **Overlap value load with QK MFMA** in `paged_attention_decode_v2_gluon_dot_kernel`: Value is loaded after QK MFMA, so value load latency is fully exposed. Restructure to issue value load before or concurrently with QK MFMA (mirrors existing pattern in `paged_attention_decode_sliding_window`).
 - [ ] **Loop unrolling**: `KV_COMPUTE_BLOCK_COUNT` is typically 1-4. Check if explicit unrolling (via `tl.static_range` or compile-time loop) helps.
-- [ ] **num_stages**: Currently hardcoded to `num_stages=1`. If Triton supports multi-stage pipelining for Gluon kernels, try `num_stages=2` to overlap next iteration's loads with current compute.
+- [ ] **num_stages**: Currently hardcoded to `num_stages=1`. If Triton supports multi-stage pipelining for Gluon kernels, try `num_stages=2` to overlap next iteration's loads with current compute. **NOTE**: Autotune sweep showed num_stages=1-4 had no meaningful impact on the sliding_window_head_1 kernel.
 
 #### 1.3.1 Softmax Reduce Optimization (Highest Impact)
 The softmax cross-wave reduce phase (source :189 and :291) is the **single largest bottleneck** at ~96K stall cycles (40.6% of all stalls). It currently performs two sequential reduce passes (max and sum) each with 3-4 barriers:
@@ -125,18 +152,79 @@ Optimizations:
 ## How To Apply
 
 1. **Read the source**: Always start by reading the latest version of `pa_decode_gluon.py`.
-2. **Profile first**: Before making changes, establish a baseline using `rocprofv3` or the aiter benchmarks.
+2. **Profile first**: Before making changes, establish a baseline using `rocprofv3 --kernel-trace --stats` to measure **actual GPU kernel time**. Do NOT rely solely on end-to-end benchmarks (see Section "Benchmarking Pitfalls" below).
 3. **Apply one optimization at a time**: Make a single change, benchmark, and verify correctness before moving to the next.
-4. **Verify correctness**: Use the existing test suite (`test_pa_decode_gluon.py` or equivalent) to ensure output matches within tolerance.
-5. **Benchmark**: Compare kernel duration (us), memory bandwidth utilization (GB/s), and MFMA utilization (%) before and after.
+4. **Verify correctness**: Use the existing test suite (`test_pa_decode_gluon.py` or equivalent) to ensure output matches within tolerance. For focused testing on a specific head config, create a targeted test script (e.g., 14 tests for (4,1) heads only) rather than running the full 576-test suite which can OOM with large batch sizes.
+5. **Benchmark**: Compare **GPU kernel duration** (us) via `rocprofv3 --kernel-trace`, not end-to-end wall-clock time. Also monitor VGPR counts (arch + accum) via rocprofv3 database queries.
+6. **Clear Triton cache**: After any kernel source or compilation parameter change, clear the cache: `rm -rf ~/.triton/cache/*`. Stale cached kernels will mask your changes.
+
+## Benchmarking Pitfalls
+
+**CRITICAL: End-to-end benchmarks are misleading for this kernel.**
+
+The Triton JIT dispatch overhead for `pa_decode_gluon` is ~211us per call (CPU-side). This includes:
+- `specialize_impl` called ~30 times per launch to hash all 50+ kernel arguments (~105us)
+- Python argument marshalling and grid computation (~106us)
+
+For kernels with GPU time < 200us, this CPU overhead **dominates** the end-to-end measurement from `triton.testing.do_bench`. A kernel change that doubles GPU time from 149us to 670us may appear neutral or even beneficial in end-to-end measurement because `do_bench` measures wall-clock time where 211us of CPU overhead masks the GPU regression.
+
+**Always measure GPU kernel time separately:**
+
+```bash
+# Method 1: rocprofv3 kernel trace (recommended)
+rocprofv3 --kernel-trace --stats -- python bench_target.py
+# Parse the results.db SQLite database:
+sqlite3 results.db "
+  SELECT ks.KernelName,
+         COUNT(*) as calls,
+         ROUND(AVG(kd.end - kd.start)/1000.0, 1) as avg_us,
+         ROUND(MIN(kd.end - kd.start)/1000.0, 1) as min_us
+  FROM rocpd_kernel_dispatch kd
+  JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+  WHERE ks.KernelName LIKE '%paged_attention%'
+  GROUP BY ks.KernelName
+  ORDER BY avg_us DESC;
+"
+
+# Method 2: Check VGPR allocation
+sqlite3 results.db "
+  SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count
+  FROM rocpd_kernel_dispatch kd
+  JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+  JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
+  WHERE ks.KernelName LIKE '%paged_attention%'
+  LIMIT 5;
+"
+```
+
+## Kernel Dispatch Path Reference
+
+Understanding which kernel gets dispatched for a given configuration:
+
+| Condition | Kernel Function | Notes |
+|-----------|----------------|-------|
+| `PS=True` or `SLIDING_WINDOW>0`, `num_kv_heads=1` | `paged_attention_decode_sliding_window_head_1` (line ~897) | Single KV-head specialization |
+| `PS=True` or `SLIDING_WINDOW>0`, `num_kv_heads>1` | `paged_attention_decode_sliding_window` | General sliding window |
+| `KV_BLOCK_SIZE=1024` | `paged_attention_decode_v2_gluon_large_block_dot_kernel` | Large block variant |
+| Default (no PS, no SW, block<1024) | `paged_attention_decode_v2_gluon_dot_kernel` | Standard kernel |
+
+The PS path is launched via `_paged_attention_decode_v2_with_dot_kernel_reshape_wrapper` (line ~4295). Kernel launch parameters end at line ~4440 (`ONE_SHOT=ONE_SHOT,`).
+
+**ISA trace invalidation**: Any compilation parameter change (maxnreg, num_stages, waves_per_eu) produces entirely different ISA. All ISA-level optimization tasks (instruction scheduling, LDS patterns, VGPR layout) must be re-analyzed after any such change.
 
 ## Quick Wins (Highest Impact, Lowest Risk)
 
+### Kernel-Level (requires re-profiling after each change)
 1. **Merge softmax max/sum reduce passes** — reduces ~7 barriers to ~3-4, saving ~40K+ stall cycles (estimated 15-20% kernel speedup). Modifies reduce logic only.
 2. **K-cache prefetch double-buffering** — eliminates ~33K stall at `s_waitcnt vmcnt(0)` before MFMA. Register headroom is sufficient (201 spare regs). See `/prefetch-data-load`.
 3. **Hoist V-value loads into barrier-wait region** — overlaps ~17K idle with ~96K barrier stall, nearly free latency hiding.
 4. **Overlap value load with QK MFMA** in `dot_kernel` — mirrors existing pattern in sliding_window kernel.
-5. **Fix duplicate tensor allocation** in `pa_decode_gluon()` API — pure cleanup, zero risk.
+
+### Caller-Level (no kernel changes, validated improvements)
+5. **Pre-allocate temp buffers** — pass `exp_sums`, `max_logits`, `temporary_output` as pre-allocated tensors to `pa_decode_gluon()` instead of letting it allocate per call. **Measured: 15.2% end-to-end latency reduction** (184.8us -> 156.8us for BS=128). The API already supports these as optional parameters.
+6. **Use ONE_SHOT mode for small batch sizes** — when `max_context_partition_num <= 1`, set `one_shot=True` to skip the reduction kernel. **Measured: 38.5% end-to-end reduction** for BS=4 (176us -> 108.3us). Automatically detected by the API but callers should set `max_context_partition_num` correctly.
+7. **Fix duplicate tensor allocation** in `pa_decode_gluon()` API — pure cleanup, zero risk.
+8. **Reduce Triton JIT dispatch overhead** — specialize_impl is called ~30 times per launch. Consider caching argument hashes or using `@triton.autotune` with a single config to skip specialization.
 
 ## Trace-Based Evidence (MI308 gfx942, dispatch 4025)
 
@@ -152,10 +240,22 @@ Reference trace: `~/Documents/ui_output_agent_12034_dispatch_4025/`
 
 MFMA utilization: **1.4%** (32 MFMA instructions, 10,280 / 735,416 total cycles) — severely memory/sync bound.
 
+## Remote Workflow (SSH + Docker)
+
+When the kernel runs on a remote MI300X host inside a Docker container:
+
+1. **Write scripts locally** (e.g., `apply_config.py`, `test_correctness.py`, `profile_overhead.py`)
+2. **Transfer via scp + docker cp**: `scp script.py host:/tmp/ && ssh host 'docker cp /tmp/script.py container:/path/'`
+3. **Run via docker exec**: `ssh host 'docker exec container python /path/script.py'`
+4. **Do NOT try inline Python in SSH**: Nested quoting (bash -> ssh -> docker exec -> python) fails with syntax errors. Always use script files.
+5. **Repos in container**: `/opt/triton` (branch: `rocm-maxnreg-support-v35`), `/opt/aiter`, plus the working copy at `/mnt/sixifang/aiter`
+6. **Backup before modifying**: `cp pa_decode_gluon.py pa_decode_gluon.py.bak` and restore between experiments
+
 ## Output
 
 After optimization, report:
 - Which optimizations were applied
-- Before/after kernel duration (if benchmarked)
+- Before/after **GPU kernel duration** (from rocprofv3, not end-to-end)
+- VGPR allocation (arch + accum) before/after
 - Any correctness concerns or trade-offs
 - Remaining optimization opportunities

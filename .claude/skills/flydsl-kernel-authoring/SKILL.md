@@ -598,6 +598,7 @@ Produces numbered `.mlir` files per pipeline stage plus `final_isa.s`.
 | Variable | Default | Description |
 |---|---|---|
 | `FLYDSL_DUMP_IR` | false | Dump IR at each stage |
+| `FLYDSL_DEBUG_ENABLE_DEBUG_INFO` | true | Emit DWARF debug info (source-to-asm mapping) |
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | true | Enable kernel caching |
 | `FLYDSL_RUNTIME_CACHE_DIR` | ~/.flydsl/cache | Cache directory |
 | `FLYDSL_COMPILE_OPT_LEVEL` | 2 | Optimization level (0-3) |
@@ -607,6 +608,68 @@ Produces numbered `.mlir` files per pipeline stage plus `final_isa.s`.
 ```bash
 FLYDSL_RUNTIME_ENABLE_CACHE=0 python my_kernel.py
 ```
+
+### Source-to-Assembly Debug Info
+
+FlyDSL supports source-to-assembly mapping for rocprofv3 ATT traces via the MLIR
+`ensure-debug-info-scope-on-llvm-func` pass (equivalent to Triton's `add_di_scope`).
+
+**How it works**:
+1. FlyDSL's `FuncLocationTracker` generates MLIR `loc()` metadata pointing to Python source lines
+2. The `ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}` pass converts MLIR locations into LLVM `DISubprogramAttr` / `DICompileUnitAttr` metadata
+3. The `-g` flag in `gpu-module-to-binary` preserves this metadata as `.debug_line` in the HSACO binary
+4. rocprofv3 ATT reads `.debug_line` to produce `code.json` with `"source_file:line"` entries
+
+**Pipeline position**: After `reconcile-unrealized-casts`, before `gpu-module-to-binary`:
+```
+... -> reconcile-unrealized-casts
+    -> ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}  (conditional on enable_debug_info)
+    -> gpu-module-to-binary{format=fatbin opts=-g}
+```
+
+**Verification**: With `FLYDSL_DUMP_IR=1`, check `final_isa.s` for `.file` and `.loc` directives.
+The PA decode kernel achieves 99.9% coverage (1109/1110 ISA instructions mapped to source).
+
+**Key insight**: Without this pass, MLIR `loc()` metadata is silently dropped during MLIR-to-LLVM-IR
+translation. The `-g` flag alone is useless — it preserves debug info, but there's none to preserve
+without the DI scope pass.
+
+### Autotune Module
+
+FlyDSL includes a Triton-style autotune module at `/FlyDSL/python/flydsl/autotune.py`:
+
+```python
+from flydsl.autotune import autotune, Config, do_bench
+
+@autotune(
+    configs=[
+        Config(block_dim=64, vec_width=4),
+        Config(block_dim=128, vec_width=4),
+        Config(block_dim=256, vec_width=4),
+    ],
+    key=['const_n'],     # re-tune when these arg values change
+    warmup=5, rep=25,    # benchmark timing params
+)
+@flyc.jit
+def myKernel(A, C, n: fx.Int32, const_n: fx.Constexpr[int],
+             block_dim: fx.Constexpr[int], vec_width: fx.Constexpr[int],
+             stream: fx.Stream = fx.Stream(None)):
+    ...
+```
+
+- `Config` kwargs become `Constexpr` args injected into `@jit` call
+- `Config.num_warps`, `waves_per_eu`, `maxnreg` are special compiler-level options
+- First call benchmarks all configs; subsequent calls use cached best
+- Disk cache at `~/.flydsl/autotune/{func_name}.json`
+- `do_bench(fn, warmup=5, rep=25)` benchmarks using CUDA/HIP events, returns median ms
+
+**IMPORTANT**: `waves_per_eu` does NOT work via `gpu-module-to-binary opts=`. It needs to be
+set as an LLVM function attribute or through `rocdl-attach-target`. This is a known limitation.
+
+**DLTensorAdaptor bug**: Do NOT use `flyc.from_dlpack()` with pre-wrapped tensors when calling
+a `@jit` function with varying `Constexpr` values. The `DLTensorAdaptor` caches MLIR types from
+the first `ir.Context`, which become invalid when a new context is created (causes segfault).
+Pass raw `torch.Tensor` objects instead.
 
 ---
 

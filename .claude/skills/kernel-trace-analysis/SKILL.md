@@ -53,30 +53,114 @@ sudo apt-get install -y xdotool xclip imagemagick
 
 ### rocprof-compute-viewer Setup
 
-The trace viewer is a Windows Qt6 application run via Wine:
+ROCprof Compute Viewer (RCV) visualizes ATT trace data from `ui_output_agent_*_dispatch_*` directories.
+It is a Windows Qt6 application run via Wine:
 
 ```
 ~/.wine/drive_c/Program Files (x86)/ROCprof-Compute-Viewer/bin/rocprof-compute-viewer.exe
 ```
 
-Launch with a trace data directory as argument:
+Launch with a `ui_output_agent_XXX_dispatch_YYY` directory as argument:
 
 ```bash
-DISPLAY=:0 wine "~/.wine/drive_c/Program Files (x86)/ROCprof-Compute-Viewer/bin/rocprof-compute-viewer.exe" \
-  "Z:\path\to\ui_output_agent_XXX_dispatch_YYY"
+DISPLAY=:0 wine "C:\\Program Files (x86)\\ROCprof-Compute-Viewer\\bin\\rocprof-compute-viewer.exe" \
+  "Z:\\path\\to\\ui_output_agent_XXX_dispatch_YYY" &
 ```
 
-Since the MCP screenshot tool may not cover multi-monitor setups correctly, use
-`xwd` + `imagemagick` for reliable window capture:
+**Important**: The MCP computer-use screenshot tool may not work with multi-monitor setups
+(Wine windows often open on the secondary monitor). Use `xwd` + `imagemagick` instead:
 
 ```bash
-# Find the window
-DISPLAY=:0 xdotool search --name "rocprof"
-# Capture specific window
+# Find the main viewer window (look for "ROCprof Compute Viewer" title)
+DISPLAY=:0 xdotool search --name "ROCprof Compute Viewer"
+# Move it to primary display if needed
+DISPLAY=:0 xdotool windowmove <WINDOW_ID> 50 50
+# Capture the window
 DISPLAY=:0 xwd -id <WINDOW_ID> | convert xwd:- /tmp/rocprof_screenshot.png
 ```
 
 Use the `Read` tool to view the resulting PNG (Claude Code is multimodal).
+
+### RCV Keyboard Shortcuts & Mouse Controls
+
+**Plots (Wave States, Occupancy, Dispatches):**
+| Action | Control |
+|--------|---------|
+| Zoom horizontal | Mouse wheel |
+| Zoom vertical | Ctrl + Mouse wheel |
+| Pan | Right click + drag |
+| Reset axis | Ctrl + Left click |
+| Select area | Left click + drag |
+| Measure cycles | Right click + drag (also in Global View, CU, Utilization) |
+
+**Compute Unit & Utilization tabs:**
+| Action | Control |
+|--------|---------|
+| Pan left/right | A / D keys |
+| Vertical scroll | Mouse wheel |
+| Zoom in/out | Ctrl + Mouse wheel |
+| Highlight ISA | Left click on token |
+
+**Tab navigation:**
+| Action | Control |
+|--------|---------|
+| Switch tab | Left click on tab header |
+| Keep multiple tabs open | Ctrl + Left click on tab header |
+
+### RCV Tab Reference
+
+| Tab | Shows | Key Use |
+|-----|-------|---------|
+| **Hotspot** | Histogram of instruction latency costs (stall+execute, no idle). Bins adjustable via Edit→Hotspot Options. Click a bin to highlight ISA lines in it. Computed over WaveView Clock Range. |
+| **Instructions** | ISA list with Hitcount/Latency per instruction. Cost mode: mean/sum per wave or all waves. Arrows link memory ops to their s_waitcnt. Left/right arrows navigate to SQTT token. Hover/click ISA ↔ source line. |
+| **Wave States** | Active waves per state (IDLE, EXEC, STALL, WAIT) over time for target CU. Vertical slice of CU tab. |
+| **Occupancy** | Waves per Shader Engine over time. |
+| **Kernel Dispatches** | Per-kernel occupancy timeline. |
+| **Compute Unit** | Per-wave trace timeline (one row per SIMD-Slot). Color = instruction type. |
+| **Utilization** | Per-SIMD trace by instruction type (VALU, VMEM, SCALAR, OTHER). Hides IMMED tokens and stalled time, shows only issue/execution. Good for finding pipeline bubbles. |
+| **Counters** | Hardware perf counter plots (if collected with `--att-perfcounters`). |
+| **Global View** | All waves across all Shader Engines, color-coded by kernel. |
+| **Summary** | (MI2xx/MI3xx only) Average instruction cost, hardware utilization by type, per-CU rates. Requires `--att-activity 10` or explicit SQ_ACTIVE_INST_* counters. |
+| **Explorer** | Hierarchical file browser with per-file hotspot bars. Click file to see top latency lines. |
+
+### RCV Left Side Panel
+
+- **Shader/SIMD/Slot/WaveID**: Select target wave for instruction-level analysis
+- **WaveView Clock Range**: Defines visible cycles for CU/Utilization tabs and Hotspot calculation. Narrow it to focus on specific regions.
+- **GlobalView zoom** [0-15]: Zoom level for Global View
+- **WaveView zoom** [0-10]: Zoom level for trace views
+- **Iteration**: Loop iteration navigator. Click a token to set, or edit directly to jump between loop iterations.
+- **Search**: Find text in ISA view (e.g., `ds_` to find LDS instructions, `mfma` to find MFMA)
+- **History**: Go back to previously selected tokens
+
+### Collecting Summary Data
+
+To enable the Summary tab (MI300X), collect with activity counters:
+
+```bash
+# Convenience parameter
+rocprofv3 --att-activity 10 --att ...
+
+# Or explicit counters
+rocprofv3 --att-perfcounter-ctrl 10 \
+  --att-perfcounters "SQ_BUSY_CU_CYCLES SQ_VALU_MFMA_BUSY_CYCLES SQ_ACTIVE_INST_VALU SQ_ACTIVE_INST_LDS SQ_ACTIVE_INST_VMEM SQ_ACTIVE_INST_FLAT SQ_ACTIVE_INST_SCA SQ_ACTIVE_INST_MISC" \
+  --att ...
+```
+
+### Collecting Hardware Counters
+
+Up to 8 SQ counters (4 recommended). On MI300, `--att-perfcounter-ctrl 3` gives 120-240 cycle polling:
+
+```bash
+rocprofv3 --att-perfcounter-ctrl 3 \
+  --att-perfcounters "SQ_VALU_MFMA_BUSY_CYCLES SQ_INSTS_VALU SQ_INSTS_MFMA SQ_INST_LEVEL_LDS" \
+  --att ...
+```
+
+Per-SIMD filtering with `:0xMask` (default 0xF = all SIMDs):
+```bash
+--att-perfcounters "SQ_INSTS_VALU:0xF SQ_INSTS_SALU:0x1 SQ_INSTS_SALU:0x2"
+```
 
 ## Workflow Overview
 
@@ -127,6 +211,46 @@ Create a timestamp file before profiling to identify new output:
 touch /tmp/trace_timestamp
 ```
 
+### 1.1 Using the rocprofv3 SQLite Database (Preferred)
+
+`rocprofv3 --kernel-trace` also produces a `results.db` SQLite database. This is often more reliable than parsing CSV files and provides structured access to kernel timing AND VGPR counts:
+
+```bash
+# Find the database
+find . -maxdepth 3 -name "results.db" -newer /tmp/trace_timestamp 2>/dev/null
+```
+
+```sql
+-- Kernel timing summary
+SELECT ks.KernelName,
+       COUNT(*) as calls,
+       ROUND(AVG(kd.end - kd.start)/1000.0, 1) as avg_us,
+       ROUND(MIN(kd.end - kd.start)/1000.0, 1) as min_us,
+       ROUND(MAX(kd.end - kd.start)/1000.0, 1) as max_us
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+GROUP BY ks.KernelName
+ORDER BY avg_us DESC
+LIMIT 20;
+
+-- VGPR allocation (arch vs accum - critical for CDNA3 occupancy analysis)
+SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count,
+       ki.sgpr_count, ki.lds_size
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
+WHERE ks.KernelName LIKE '%target_kernel%'
+LIMIT 5;
+```
+
+### 1.2 GPU Kernel Time vs End-to-End Time (CRITICAL)
+
+**Always measure GPU kernel time via rocprofv3, not end-to-end wall-clock time.**
+
+For Triton/Gluon kernels, the CPU-side JIT dispatch overhead can be 100-200+ us per call (argument specialization, hash computation, grid calculation). For kernels with GPU time < 200us, this CPU overhead **dominates** end-to-end measurements like `triton.testing.do_bench`.
+
+A kernel change that increases GPU time by 4.5x can appear neutral in end-to-end benchmarks because the CPU overhead masks the regression. Always compare GPU kernel duration from `rocprofv3 --kernel-trace` before and after optimization.
+
 ---
 
 ## Step 2: Configure input.yaml
@@ -172,36 +296,68 @@ Key configuration notes:
 
 ## Step 3: Collect ATT Trace
 
-Run rocprofv3 with the configured input:
+### Option A: Using input.yaml (recommended for full control)
 
 ```bash
 rocprofv3 -i /tmp/trace_input.yaml -- <CMD> 2>&1
 ```
 
-This creates a directory like `kernel_trace_output/` containing:
-- `ui_output_agent_<PID>/` - The ATT trace results
-- Inside: CSV files with per-instruction cycle data
+### Option B: Using CLI flags (simpler, no yaml needed)
+
+```bash
+rocprofv3 --att \
+  --att-target-cu 1 \
+  --att-shader-engine-mask 0xf \
+  --att-simd-select 0xf \
+  --att-buffer-size 0x6000000 \
+  --kernel-include-regex "<KERNEL_NAME_PATTERN>" \
+  -o /path/to/output \
+  -- <CMD> 2>&1
+```
+
+**Note**: `--att` is a boolean flag (no value). The ATT library `librocprof-trace-decoder.so`
+must be in `/opt/rocm/lib/`. If missing, install from
+[rocprof-trace-decoder releases](https://github.com/ROCm/rocprof-trace-decoder/releases):
+
+```bash
+wget -q https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
+chmod +x rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
+./rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh --skip-license --prefix=/tmp/rtd-install
+find /tmp/rtd-install -name '*.so*' -exec cp -a {} /opt/rocm/lib/ \;
+ldconfig
+```
+
+### Output Structure
+
+Both options create a directory containing:
+
+```
+output_directory/
+├── ui_output_agent_<PID>_dispatch_<N>/    # Per-dispatch trace (RCV compatible)
+│   ├── code.json                          # Per-instruction stall/idle/latency
+│   ├── occupancy.json                     # Occupancy data
+│   ├── filenames.json                     # Source file mapping
+│   ├── snapshots.json                     # Trace snapshots
+│   ├── wstates*.json                      # Wave state data
+│   ├── se*_sm*_sl*_wv*.json              # Per-wave raw traces
+│   ├── source_0_*.py                      # Snapshotted source files
+│   └── source_1_*.py
+├── stats_ui_output_agent_*_dispatch_*.csv # Per-dispatch stats
+├── out_kernel_trace.csv                   # Kernel launch info
+├── out_*_shader_engine_*.att              # Raw ATT data per SE
+├── out_gfx942_code_object_id_*.out        # Code object binaries
+├── out_results.json                       # Full results (can be large, 100MB+)
+├── out_hip_api_trace.csv                  # HIP API trace
+└── out_hsa_api_trace.csv                  # HSA API trace
+```
+
+The `ui_output_agent_*_dispatch_*` directories are what rocprof-compute-viewer opens.
 
 Locate the trace output:
 
 ```bash
-# Find the ui_output directory
-find kernel_trace_output -type d -name "ui_output_agent_*" 2>/dev/null
-# Or in current directory
 find . -type d -name "ui_output_agent_*" -newer /tmp/trace_timestamp 2>/dev/null
 ```
-
-Inside `ui_output_agent_*`, look for CSV files:
-
-```bash
-ls kernel_trace_output/ui_output_agent_*/
-```
-
-The key files are:
-- `*.csv` files containing instruction-level trace data with columns like:
-  - `instruction` - The ISA instruction (e.g., `s_waitcnt`, `v_mfma_*`, `buffer_load_*`)
-  - `cycles` or `duration` - Cycle count for this instruction
-  - `type` - Instruction category (VMEM, SMEM, VALU, MFMA, SALU, BARRIER, etc.)
 
 ---
 
@@ -296,7 +452,38 @@ max_agpr = max((int(m.group(1)) for inst in instructions for m in re.finditer(r'
 print(f"VGPR: {max_vgpr+1}, AGPR: {max_agpr+1}, Total: {max_vgpr+max_agpr+2}/512")
 ```
 
-### 4.4 Categorize bottleneck instructions
+### 4.4 Visual Analysis with rocprof-compute-viewer
+
+After programmatic analysis, open the trace in RCV for visual inspection:
+
+```bash
+DISPLAY=:0 wine "C:\\Program Files (x86)\\ROCprof-Compute-Viewer\\bin\\rocprof-compute-viewer.exe" \
+  "Z:\\path\\to\\ui_output_agent_XXX_dispatch_YYY" &
+sleep 5
+# Find and capture the window
+WID=$(DISPLAY=:0 xdotool search --name "ROCprof Compute Viewer" | head -1)
+DISPLAY=:0 xdotool windowmove $WID 50 50  # Move to primary display
+DISPLAY=:0 xwd -id $WID | convert xwd:- /tmp/rcv_overview.png
+```
+
+**Visual analysis checklist:**
+
+1. **Hotspot tab**: Check the histogram for dominant instruction bins. Click bins to jump to ISA.
+2. **Instructions tab**: Sort by "Latency: Sum all" to see aggregate costs. Use arrows to trace memory→waitcnt dependencies.
+3. **Compute Unit tab**: Look for waves with long stall bars (yellow/red). Use A/D to pan, Ctrl+wheel to zoom.
+4. **Utilization tab**: Check for pipeline bubbles (gaps between VALU/VMEM bars). If MFMA bars are sparse, the kernel is memory-bound.
+5. **Wave States tab**: Check STALL vs EXEC ratio. High STALL = memory-bound.
+6. **Summary tab** (if collected with `--att-activity`): Read hardware utilization percentages directly.
+
+**Capture specific tabs:**
+```bash
+# Click tab with xdotool (use coordinates relative to window)
+DISPLAY=:0 xdotool mousemove --window $WID <TAB_X> <TAB_Y> && xdotool click 1
+sleep 1
+DISPLAY=:0 xwd -id $WID | convert xwd:- /tmp/rcv_<tab_name>.png
+```
+
+### 4.5 Categorize bottleneck instructions
 
 Group the high-cycle instructions into categories:
 
@@ -389,14 +576,45 @@ Gluon kernels (e.g., paged attention) often have cross-wave reduce phases (softm
 
 ### 5.5 Register Pressure Check
 
-For gfx942 (MI308/MI300X):
+For gfx942 (MI308/MI300X), VGPRs are split into **two separate register files**:
+
 ```
-Max archVGPR = 512 (shared between VGPR and AGPR)
-Occupancy: 512/total_regs waves/SIMD (rounded down)
-  ≤256 regs → 2 waves    ≤512 regs → 1 wave    >512 → SPILL (critical)
+arch_vgpr: General-purpose vector registers (VALU, VMEM, LDS ops)
+accum_vgpr (AGPR): Accumulator registers (MFMA result writeback only)
+
+Each SIMD has 256 arch_vgpr and 256 accum_vgpr slots.
+Occupancy = 256 / max(arch_vgpr, accum_vgpr) waves per SIMD.
+
+Examples:
+  arch=148, accum=148 → 256/148 = 1 wave/SIMD (max of either = 148)
+  arch=128, accum=148 → 256/148 = 1 wave/SIMD (accum is bottleneck)
+  arch=128, accum=0   → 256/128 = 2 waves/SIMD (no accum)
+  arch=256, accum=256  → 256/256 = 1 wave/SIMD
+  > 256 in either file → SPILL (critical)
 ```
 
-Always report register usage when analyzing Gluon kernel traces. If headroom > 128 regs, prefetch double-buffering is likely feasible. If headroom < 32 regs, any optimization that adds registers risks spills.
+**IMPORTANT**: `maxnreg` can force `accum_vgpr=0`, which doubles occupancy but causes MFMA results to spill through arch_vgpr. This is almost always a net regression for MFMA-heavy kernels (measured 4.5x GPU slowdown). See `/optimize-pa-decode-gluon` Section 1.2.1 for details.
+
+**How to check VGPR allocation** (from rocprofv3 database):
+```sql
+SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
+JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
+WHERE ks.KernelName LIKE '%target_kernel%'
+LIMIT 5;
+```
+
+**From ISA trace** (less reliable, only shows registers actually used):
+```python
+import re
+max_vgpr = max(int(m.group(1)) for inst in instructions for m in re.finditer(r'v\[?(\d+)', inst[0]))
+max_agpr = max((int(m.group(1)) for inst in instructions for m in re.finditer(r'a\[?(\d+)', inst[0])), default=0)
+print(f"arch_vgpr: ~{max_vgpr+1}, accum_vgpr: ~{max_agpr+1}")
+print(f"Occupancy bottleneck: {'arch' if max_vgpr > max_agpr else 'accum'} ({max(max_vgpr, max_agpr)+1})")
+```
+
+Always report **both** arch_vgpr and accum_vgpr when analyzing traces. For prefetch feasibility, check headroom in the arch_vgpr file specifically (since prefetch buffers use arch_vgpr, not accum_vgpr).
 
 ### 5.6 MFMA Utilization
 
@@ -527,6 +745,31 @@ reduce instruction count.
 
 ---
 
+## FlyDSL Source-to-Assembly Mapping
+
+FlyDSL kernels support source-to-assembly mapping in rocprofv3 ATT traces, enabling the same
+`code.json` source annotations as Triton/Gluon kernels. This requires:
+
+1. **`FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`** (default: true) — enables the `ensure-debug-info-scope-on-llvm-func` MLIR pass and `-g` flag
+2. The pass converts MLIR `loc()` metadata into LLVM DWARF debug info (`DISubprogram`, `.debug_line`)
+3. rocprofv3 reads `.debug_line` from the HSACO binary to produce source mappings
+
+**Verification**: In `code.json`, each instruction entry has a source field (index 3):
+```json
+["s_load_dwordx8 s[8:15], s[0:1], 0x18", 0, 1, "/FlyDSL/kernels/pa_decode_fp8.py:123", ...]
+```
+
+**If source mappings are missing** (source field is empty `""`):
+- Check that `FLYDSL_DEBUG_ENABLE_DEBUG_INFO` is not set to `0`/`false`
+- Verify the `ensure-debug-info-scope-on-llvm-func` pass is in the pipeline (check `FLYDSL_DUMP_IR=1` output for stage `14_ensure_debug_info_scope_on_llvm_func`)
+- Verify `.loc`/`.file` directives exist in `final_isa.s` (dump with `FLYDSL_DUMP_IR=1`)
+- The pass must run AFTER `reconcile-unrealized-casts` and BEFORE `gpu-module-to-binary`
+
+**How it compares to Triton**: Triton uses `passes.llvmir.add_di_scope(pm)` (a custom C++ pass in
+`/triton/lib/Target/LLVMIR/LLVMDIScopePass.cpp`). FlyDSL uses MLIR's standard
+`ensure-debug-info-scope-on-llvm-func` pass which is functionally equivalent.
+Both convert MLIR source locations into LLVM `DISubprogramAttr` metadata.
+
 ## Error Handling
 
 - If `rocprofv3` is not found: check `which rocprofv3` and suggest `export PATH=/opt/rocm/bin:$PATH`
@@ -535,6 +778,12 @@ reduce instruction count.
 - If trace is truncated: increase `att_buffer_size` (e.g., `"0xC000000"` for 192MB)
 - If `kernel_iteration_range` doesn't match: the command may run fewer iterations. Try `"[0, [1-2]]"`
 - If permission denied: `rocprofv3` may require `sudo` or the user to be in the `video` group
+- If `rocprof-trace-decoder library path not found`: install the decoder library (see Step 3 above)
+- If `--advanced-thread-trace <file>` fails with "invalid truth value": `--att` is a boolean flag, use `-i input.yaml` for file-based config or `--att` with separate `--att-*` CLI flags
+- If `--stats` fails with "No tracing options enabled": add `--kernel-trace` before `--stats`
+- If RCV window opens on wrong monitor: use `xdotool windowmove <WID> 50 50` to move it
+- If RCV shows nothing except Occupancy: the target_cu was not populated by the application. Try a different `att_target_cu` value
+- If `INVALID_SHADER_DATA` error: aqlprofile and decoder versions are incompatible. Update both.
 
 ## Output
 
