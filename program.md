@@ -104,7 +104,7 @@ RECENT_REGRESSIONS=[]  # rolling window, max len = 5
 1. 先执行 `GPU Availability Gate`，拿到一张空闲 GPU，然后在这张 GPU 上运行固定 benchmark，并把完整输出写入日志：
 
 ```bash
-python tests/kernels/test_pa.py -d bf16 -n 16,2 -hd 128 -q 1 -c 8192 -b 64 --block_size 1024 > baseline.log 2>&1
+python tests/kernels/test_pa.py
 ```
 
 2. 确认：
@@ -127,7 +127,7 @@ PY
 4. 再次执行 `GPU Availability Gate`，然后对同一条 benchmark 命令运行：
 
 ```text
-/kernel-trace-analysis python tests/kernels/test_pa.py -d bf16 -n 16,2 -hd 128 -q 1 -c 8192 -b 64 --block_size 1024
+/kernel-trace-analysis python tests/kernels/test_pa.py
 ```
 
 5. 从 trace report 中记录：
@@ -352,7 +352,7 @@ LOOP FOREVER:
 示例：
 
 ```text
-| 2026-04-16 | abc1234 | keep | python tests/kernels/test_pa.py -d bf16 -n 16,2 -hd 128 -q 1 -c 8192 -b 64 --block_size 1024 | pa_persistent_fwd | 142.8 | 118.4 | -6.2% | hoist next-iteration loads to hide vmcnt stall |
+| 2026-04-16 | abc1234 | keep | python tests/kernels/test_pa.py | pa_persistent_fwd | 142.8 | 118.4 | -6.2% | hoist next-iteration loads to hide vmcnt stall |
 ```
 
 如果触发停止条件，则在 `performance.md` 追加：
